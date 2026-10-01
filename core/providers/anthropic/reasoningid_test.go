@@ -1,6 +1,8 @@
 package anthropic
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -323,5 +325,46 @@ func TestConvertAnthropicContentBlocksGrouped_ThinkingAndRedactedThinkingMergeIn
 	}
 	if msg.ResponsesReasoning == nil || msg.ResponsesReasoning.EncryptedContent == nil || *msg.ResponsesReasoning.EncryptedContent != ciphertext {
 		t.Errorf("encrypted_content missing or wrong, got %v", msg.ResponsesReasoning)
+	}
+}
+
+// A bare Claude id converts before governance picks a provider (issue #7768), so the
+// ungrouped path must keep each thinking run at its wire position, and must still
+// merge the run itself into one item.
+func TestToBifrostResponsesRequestBareClaudeKeepsThinkingOrder(t *testing.T) {
+	sig := func(s string) *string { return &s }
+	th := func(text, s string) AnthropicContentBlock {
+		return AnthropicContentBlock{Type: AnthropicContentBlockTypeThinking, Thinking: &text, Signature: sig(s)}
+	}
+	txt := func(text string) AnthropicContentBlock {
+		return AnthropicContentBlock{Type: AnthropicContentBlockTypeText, Text: &text}
+	}
+	tool := func(id string) AnthropicContentBlock {
+		return AnthropicContentBlock{Type: AnthropicContentBlockTypeToolUse, ID: &id, Name: sig("t"), Input: []byte(`{}`)}
+	}
+	req := &AnthropicMessageRequest{
+		Model: "claude-opus-5-5",
+		Messages: []AnthropicMessage{{
+			Role: AnthropicMessageRoleAssistant,
+			Content: AnthropicContent{ContentBlocks: []AnthropicContentBlock{
+				th("a", "sig0"), th("a2", "sig0b"), txt("x"), tool("t0"), th("b", "sig1"), txt("y"), tool("t1"),
+			}},
+		}},
+	}
+	out := req.ToBifrostResponsesRequest(&schemas.BifrostContext{})
+	var got []string
+	for _, m := range out.Input {
+		switch {
+		case m.Type != nil && *m.Type == schemas.ResponsesMessageTypeReasoning:
+			got = append(got, "reasoning:"+fmt.Sprint(len(m.Content.ContentBlocks)))
+		case m.Type != nil && *m.Type == schemas.ResponsesMessageTypeFunctionCall:
+			got = append(got, "call:"+*m.ResponsesToolMessage.CallID)
+		default:
+			got = append(got, "message")
+		}
+	}
+	want := []string{"reasoning:2", "message", "call:t0", "reasoning:1", "message", "call:t1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("thinking order not preserved:\n got  %v\n want %v", got, want)
 	}
 }
